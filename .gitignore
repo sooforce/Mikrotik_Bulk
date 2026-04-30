@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Runtime log
+mikrotik_provisioner.log
+
+# IDE
+.vscode/
+.idea/
