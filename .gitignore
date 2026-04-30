@@ -11,6 +11,6 @@ build/
 # Runtime log
 mikrotik_provisioner.log
 
-# IDE
+# IDE / editor
 .vscode/
 .idea/
