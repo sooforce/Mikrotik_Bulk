@@ -28,6 +28,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
+import subprocess
+import urllib.request
+import urllib.error
+
 import paramiko
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -54,7 +58,9 @@ SSH_PORT           = 22
 SSH_TIMEOUT        = 10     # seconds – TCP connect + SSH handshake
 SSH_BANNER_TIMEOUT = 15     # seconds – waiting for SSH banner
 CMD_TIMEOUT        = 30     # seconds – individual SSH command
-SSH_RETRIES        = 2      # extra retry attempts on connect failure
+SSH_RETRIES        = 3      # total SSH connect attempts
+FETCH_RETRIES      = 2      # total /tool fetch attempts
+IMPORT_RETRIES     = 2      # total /import attempts
 FETCH_TIMEOUT      = 120    # seconds – /tool fetch may take a while
 
 SCAN_THREADS = 60           # parallel TCP-check workers during discovery
@@ -70,15 +76,25 @@ COL_IDENTITY = 3
 COL_VERSION  = 4
 COL_STATUS   = 5
 
-# Row background colours keyed by status string
+# Row background / foreground colours keyed by status string
 STATUS_COLORS: Dict[str, str] = {
-    "Discovered":       "#e8f4fd",
-    "Queued":           "#e8f4fd",
-    "Connecting":       "#fff9c4",
-    "Fetching config":  "#fff9c4",
-    "Importing config": "#fff9c4",
-    "Success":          "#d4edda",
-    "Failed":           "#f8d7da",
+    "Discovered":       "#dbeafe",  # blue-50
+    "Queued":           "#fef9c3",  # yellow-100
+    "Connecting":       "#fef3c7",  # amber-100
+    "Fetching config":  "#ffedd5",  # orange-100
+    "Importing config": "#fce7f3",  # pink-100
+    "Success":          "#dcfce7",  # green-100
+    "Failed":           "#fee2e2",  # red-100
+}
+
+STATUS_FG: Dict[str, str] = {
+    "Discovered":       "#1e40af",  # blue-800
+    "Queued":           "#713f12",  # yellow-900
+    "Connecting":       "#92400e",  # amber-800
+    "Fetching config":  "#7c2d12",  # orange-900
+    "Importing config": "#831843",  # pink-900
+    "Success":          "#14532d",  # green-900
+    "Failed":           "#7f1d1d",  # red-900
 }
 
 
@@ -99,6 +115,43 @@ def _setup_file_logger() -> logging.Logger:
     return logger
 
 log = _setup_file_logger()
+
+# Suppress console window on Windows when spawning subprocesses
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ARP table helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_arp_table() -> Dict[str, str]:
+    """
+    Parse the Windows ARP cache and return {ip: MAC} mapping.
+    MAC addresses are normalised to uppercase colon-separated notation.
+    Returns an empty dict on any error.
+    """
+    arp_map: Dict[str, str] = {}
+    try:
+        output = subprocess.check_output(
+            ["arp", "-a"],
+            timeout=5,
+            creationflags=_NO_WINDOW,
+        ).decode("utf-8", errors="replace")
+        for line in output.splitlines():
+            parts = line.split()
+            # Windows: "  192.168.88.100   aa-bb-cc-dd-ee-ff   dynamic"
+            if len(parts) >= 2:
+                ip_part  = parts[0].strip()
+                mac_part = parts[1].strip()
+                if (
+                    ip_part.count(".") == 3
+                    and "-" in mac_part
+                    and len(mac_part) == 17
+                ):
+                    arp_map[ip_part] = mac_part.upper().replace("-", ":")
+    except Exception as exc:
+        log.debug("ARP table lookup failed: %s", exc)
+    return arp_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,10 +203,38 @@ def _ssh_connect(ip: str, username: str, password: str) -> paramiko.SSHClient:
 
 def _ssh_cmd(client: paramiko.SSHClient, command: str,
              timeout: int = CMD_TIMEOUT) -> str:
-    """Execute *command* on an open SSH client and return stdout as a string."""
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode("utf-8", errors="replace").strip()
-    err = stderr.read().decode("utf-8", errors="replace").strip()
+    """
+    Execute *command* via a direct channel with a hard deadline.
+    Polls recv_ready / exit_status_ready so a hung router cannot block
+    the worker thread indefinitely.
+    Raises TimeoutError when *timeout* seconds elapse without completion.
+    """
+    transport = client.get_transport()
+    channel   = transport.open_session()
+    try:
+        channel.settimeout(timeout)
+        channel.exec_command(command)
+        stdout_buf: bytes = b""
+        stderr_buf: bytes = b""
+        deadline = time.monotonic() + timeout
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Command timed out after {timeout}s: {command!r}")
+            if channel.recv_ready():
+                stdout_buf += channel.recv(65536)
+            if channel.recv_stderr_ready():
+                stderr_buf += channel.recv_stderr(65536)
+            if channel.exit_status_ready() and not channel.recv_ready():
+                # Final drain of any buffered stderr
+                while channel.recv_stderr_ready():
+                    stderr_buf += channel.recv_stderr(65536)
+                break
+            time.sleep(0.05)
+    finally:
+        channel.close()
+    out = stdout_buf.decode("utf-8", errors="replace").strip()
+    err = stderr_buf.decode("utf-8", errors="replace").strip()
     if err:
         log.debug("SSH stderr for %r: %s", command, err)
     return out
@@ -183,6 +264,42 @@ def _gather_router_info(ip: str, username: str, password: str) -> dict:
     finally:
         client.close()
     return info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HFS URL Check Worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UrlCheckWorker(QThread):
+    """
+    Sends an HTTP HEAD request to the config URL and reports whether the file
+    is reachable from this laptop.  Runs in a background thread so the GUI
+    stays responsive.
+    """
+
+    result = pyqtSignal(bool, str)   # (success, message)
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self.url = url
+
+    def run(self):
+        try:
+            req = urllib.request.Request(self.url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                code = resp.status
+                if code == 200:
+                    self.result.emit(
+                        True, f"OK (HTTP {code}) — config file is reachable.")
+                else:
+                    self.result.emit(
+                        False, f"HTTP {code} — unexpected status code.")
+        except urllib.error.HTTPError as exc:
+            self.result.emit(False, f"HTTP error {exc.code}: {exc.reason}")
+        except urllib.error.URLError as exc:
+            self.result.emit(False, f"Cannot reach URL: {exc.reason}")
+        except Exception as exc:
+            self.result.emit(False, f"Error: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,49 +430,89 @@ class ProvisionWorker(QThread):
 
         # Acquire the semaphore slot; blocks until a slot is free
         with self.semaphore:
-            # ── Step 1: SSH connect ──────────────────────────────────────────
+            # ── Step 1: SSH connect (with retries) ──────────────────────────
             self._set_status("Connecting")
-            self.log_message.emit(f"[{ip}] Connecting via SSH…")
+            self.log_message.emit(
+                f"[{ip}] Connecting via SSH (up to {SSH_RETRIES} attempts)…")
             try:
                 client = _ssh_connect(ip, self.ssh_user, self.ssh_pass)
             except Exception as exc:
-                msg = f"SSH connection failed: {exc}"
+                msg = f"SSH connection failed after {SSH_RETRIES} attempts: {exc}"
                 log.error("[%s] %s", ip, msg)
                 self.log_message.emit(f"[{ip}] ERROR: {msg}")
                 self._set_status("Failed", msg)
                 return
 
             try:
-                # ── Step 2: Fetch config file ────────────────────────────────
+                # ── Step 2: Fetch config (with retries) ──────────────────────
                 self._set_status("Fetching config")
                 fetch_cmd = (
                     f'/tool fetch url="{self.config_url}"'
                     f' mode=http dst-path=full-config.rsc'
                 )
-                self.log_message.emit(f"[{ip}] {fetch_cmd}")
-                try:
-                    out = _ssh_cmd(client, fetch_cmd, timeout=FETCH_TIMEOUT)
-                    log.info("[%s] fetch → %s", ip, out)
-                    self.log_message.emit(f"[{ip}] fetch output: {out}")
-                except Exception as exc:
-                    raise RuntimeError(f"Fetch failed: {exc}") from exc
+                fetch_error: Optional[Exception] = None
+                for attempt in range(1, FETCH_RETRIES + 1):
+                    try:
+                        self.log_message.emit(
+                            f"[{ip}] Fetch attempt {attempt}/{FETCH_RETRIES}: "
+                            f"{fetch_cmd}"
+                        )
+                        out = _ssh_cmd(client, fetch_cmd, timeout=FETCH_TIMEOUT)
+                        log.info("[%s] fetch → %s", ip, out)
+                        self.log_message.emit(f"[{ip}] fetch output: {out}")
+                        fetch_error = None
+                        break
+                    except Exception as exc:
+                        fetch_error = exc
+                        log.warning("[%s] Fetch attempt %d/%d failed: %s",
+                                    ip, attempt, FETCH_RETRIES, exc)
+                        if attempt < FETCH_RETRIES:
+                            time.sleep(2)
+                if fetch_error is not None:
+                    raise RuntimeError(
+                        f"Fetch failed after {FETCH_RETRIES} attempts: "
+                        f"{fetch_error}"
+                    )
 
-                # ── Step 3: Import config ────────────────────────────────────
+                # ── Step 3: Import config (with retries) ─────────────────────
                 self._set_status("Importing config")
                 import_cmd = "/import file-name=full-config.rsc"
-                self.log_message.emit(f"[{ip}] {import_cmd}")
-                try:
-                    out = _ssh_cmd(client, import_cmd, timeout=FETCH_TIMEOUT)
-                    log.info("[%s] import → %s", ip, out)
-                    self.log_message.emit(f"[{ip}] import output: {out}")
-                except Exception as exc:
-                    # A connection reset during import is expected when the
-                    # config resets interfaces or restarts services.
-                    log.info("[%s] Connection ended during import (expected): %s",
-                             ip, exc)
-                    self.log_message.emit(
-                        f"[{ip}] Note: SSH closed during import "
-                        f"(normal if config resets the router)"
+                import_error: Optional[Exception] = None
+                for attempt in range(1, IMPORT_RETRIES + 1):
+                    try:
+                        self.log_message.emit(
+                            f"[{ip}] Import attempt {attempt}/{IMPORT_RETRIES}: "
+                            f"{import_cmd}"
+                        )
+                        out = _ssh_cmd(client, import_cmd, timeout=FETCH_TIMEOUT)
+                        log.info("[%s] import → %s", ip, out)
+                        self.log_message.emit(f"[{ip}] import output: {out}")
+                        import_error = None
+                        break
+                    except Exception as exc:
+                        # Connection drop during import is expected — RouterOS
+                        # resets interfaces / services as the config is applied.
+                        exc_str = str(exc).lower()
+                        if any(k in exc_str for k in
+                               ("reset", "closed", "eof", "timed out")):
+                            log.info(
+                                "[%s] Connection ended during import (expected): %s",
+                                ip, exc)
+                            self.log_message.emit(
+                                f"[{ip}] Note: SSH closed during import "
+                                f"(normal — config may restart services)"
+                            )
+                            import_error = None
+                            break
+                        import_error = exc
+                        log.warning("[%s] Import attempt %d/%d failed: %s",
+                                    ip, attempt, IMPORT_RETRIES, exc)
+                        if attempt < IMPORT_RETRIES:
+                            time.sleep(2)
+                if import_error is not None:
+                    raise RuntimeError(
+                        f"Import failed after {IMPORT_RETRIES} attempts: "
+                        f"{import_error}"
                     )
 
                 self._set_status("Success")
@@ -386,11 +543,12 @@ class MainWindow(QMainWindow):
         self.resize(1150, 780)
 
         # Application state
-        self._routers:             Dict[str, RouterInfo]    = {}
-        self._scan_worker:         Optional[ScanWorker]     = None
-        self._provision_workers:   List[ProvisionWorker]    = []
+        self._routers:             Dict[str, RouterInfo]       = {}
+        self._scan_worker:         Optional[ScanWorker]        = None
+        self._provision_workers:   List[ProvisionWorker]       = []
         self._provision_semaphore: Optional[threading.Semaphore] = None
-        self._active_provisions:   int = 0
+        self._active_provisions:   int                         = 0
+        self._url_check_worker:    Optional[UrlCheckWorker]    = None
 
         self._build_ui()
         self._connect_signals()
@@ -450,7 +608,12 @@ class MainWindow(QMainWindow):
         url_grp = QGroupBox("Config URL  (fetched by the router via /tool fetch)")
         url_lay = QHBoxLayout(url_grp)
         self.le_config_url = QLineEdit(DEFAULT_CONFIG_URL)
+        self.btn_test_url  = QPushButton("Test HFS URL")
+        self.btn_test_url.setMinimumHeight(28)
+        self.btn_test_url.setToolTip(
+            "Verify that the config file URL is reachable from this laptop")
         url_lay.addWidget(self.le_config_url)
+        url_lay.addWidget(self.btn_test_url)
 
         # ── Scan control bar ─────────────────────────────────────────────────
         scan_bar = QHBoxLayout()
@@ -543,6 +706,7 @@ class MainWindow(QMainWindow):
         self.btn_select_all.clicked.connect(self._select_all)
         self.btn_deselect_all.clicked.connect(self._deselect_all)
         self.btn_provision.clicked.connect(self._start_provisioning)
+        self.btn_test_url.clicked.connect(self._test_hfs_url)
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -604,10 +768,12 @@ class MainWindow(QMainWindow):
             "Failed" if "Failed" in status else "Discovered"
         )
         bg = QColor(STATUS_COLORS[key])
+        fg = QColor(STATUS_FG.get(key, "#000000"))
         for col in range(self.table.columnCount()):
             item = self.table.item(row, col)
             if item:
                 item.setBackground(bg)
+                item.setForeground(fg)
 
     def _selected_routers(self) -> List[RouterInfo]:
         """Return RouterInfo objects whose checkbox is ticked."""
@@ -621,6 +787,54 @@ class MainWindow(QMainWindow):
                     if router:
                         result.append(router)
         return result
+
+    # ── HFS URL test ─────────────────────────────────────────────────────────
+
+    def _test_hfs_url(self):
+        url = self.le_config_url.text().strip()
+        if not url:
+            QMessageBox.warning(self, "No URL", "Config URL cannot be empty.")
+            return
+        self.btn_test_url.setEnabled(False)
+        self.btn_test_url.setText("Testing…")
+        self._log(f"Testing URL: {url}")
+        self._url_check_worker = UrlCheckWorker(url)
+        self._url_check_worker.result.connect(self._on_url_check_done)
+        self._url_check_worker.start()
+
+    def _on_url_check_done(self, success: bool, message: str):
+        self.btn_test_url.setEnabled(True)
+        self.btn_test_url.setText("Test HFS URL")
+        self._log(f"URL check result: {message}")
+        if success:
+            QMessageBox.information(self, "URL Reachable", message)
+        else:
+            QMessageBox.warning(self, "URL Not Reachable", message)
+
+    # ── ARP MAC refresh ───────────────────────────────────────────────────────
+
+    def _refresh_macs_from_arp(self):
+        """
+        Look up the Windows ARP cache and fill in any MAC addresses that SSH
+        could not retrieve (shown as '—').  Called after a scan completes.
+        """
+        arp = _get_arp_table()
+        if not arp:
+            return
+        updated = 0
+        for ip, router in self._routers.items():
+            if router.mac == "—" and ip in arp:
+                router.mac = arp[ip]
+                if router.row >= 0:
+                    item = QTableWidgetItem(router.mac)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+                    )
+                    self.table.setItem(router.row, COL_MAC, item)
+                    self._color_row(router.row, router.status)
+                updated += 1
+        if updated:
+            self._log(f"ARP lookup: updated {updated} MAC address(es).")
 
     # ── Scan ─────────────────────────────────────────────────────────────────
 
@@ -673,6 +887,8 @@ class MainWindow(QMainWindow):
         self.btn_stop_scan.setEnabled(False)
         self.lbl_scan.setText(f"Scan complete — {count} router(s) found.")
         self._log(f"Scan finished. {count} router(s) discovered.")
+        # Enrich any missing MACs from the Windows ARP cache
+        self._refresh_macs_from_arp()
 
     def _clear_table(self):
         if self._scan_worker and self._scan_worker.isRunning():
