@@ -213,11 +213,57 @@ All values can be adjusted at the top of `mikrotik_provisioner.py`.
 
 ---
 
+## Building a Standalone EXE  *(no Python needed on target PC)*
+
+The project includes a build script that uses
+[PyInstaller](https://pyinstaller.org/) to compile everything into a single
+`MikroProv.exe` that runs on any Windows 10/11 machine with a double-click.
+
+### Prerequisites
+
+- Python 3.10+ with `pip` (only needed on the **build** machine)
+- `assets\logo.png` present in the project folder (already included)
+
+### Steps
+
+```
+# Open PowerShell in the project folder, then:
+.\build.bat
+```
+
+The script will automatically:
+
+1. Install `pyinstaller` and `pillow` (if not already present)
+2. Convert `assets\logo.png` → `assets\logo.ico` (multi-resolution icon)
+3. Clean any previous build output
+4. Run PyInstaller with `--onefile --windowed --uac-admin`
+5. Output `dist\MikroProv.exe` (~40 MB)
+
+### Deploying to another PC
+
+Just copy `dist\MikroProv.exe` — no Python, no libraries, no installation
+required.  Double-clicking it will:
+
+- Trigger a **UAC prompt** for Administrator rights  
+  *(required for the built-in DHCP server on port 67)*
+- Open the app with the **MikroProv logo icon**
+
+> **Rebuild after code changes:** run `.\build.bat` again.  
+> The `dist\` and `build\` folders are git-ignored; only source files are tracked.
+
+---
+
 ## File Structure
 
 ```
 mikrotik_provisioner.py   ← main application (single file)
-requirements.txt          ← Python package list
+make_icon.py              ← PNG→ICO converter called by build.bat
+build.bat                 ← one-click PyInstaller build script
+requirements.txt          ← Python package list (for running from source)
+assets/
+  logo.png                ← application icon source
 README.md                 ← this file
-mikrotik_provisioner.log  ← created at runtime
+mikrotik_provisioner.log  ← created at runtime (git-ignored)
+dist/
+  MikroProv.exe           ← compiled output (git-ignored)
 ```
