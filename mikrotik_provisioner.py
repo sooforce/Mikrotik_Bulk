@@ -51,7 +51,7 @@ DEFAULT_IP_START    = "192.168.88.100"
 DEFAULT_IP_END      = "192.168.88.254"
 DEFAULT_SSH_USER    = "admin"
 DEFAULT_SSH_PASS    = ""
-DEFAULT_CONFIG_URL  = "http://192.168.88.5:8000/mikrotik-provision/full-config.rsc"
+DEFAULT_CONFIG_URL  = "http://192.168.88.5:80/mikrotik-provision/full-config.rsc"
 DEFAULT_CONCURRENCY = 6
 
 SSH_PORT           = 22

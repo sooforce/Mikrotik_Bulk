@@ -12,8 +12,8 @@ ISP staging lab.  Written in Python (PyQt6 + paramiko).
 | Laptop Ethernet IP | `192.168.88.5/24` |
 | DHCP server | Tftpd64 on the laptop |
 | Router DHCP pool | `192.168.88.100 – 192.168.88.254` |
-| HTTP file server | HFS on port 8000 |
-| Config URL | `http://192.168.88.5:8000/mikrotik-provision/full-config.rsc` |
+| HTTP file server | HFS on port 80 |
+| Config URL | `http://192.168.88.5:80/mikrotik-provision/full-config.rsc` |
 | Switch | MikroTik PoE switch between laptop and routers |
 
 Routers are first flashed via **MikroTik Netinstall** with a minimal config
@@ -65,7 +65,7 @@ python mikrotik_provisioner.py
 | SSH User | `admin` | Temporary admin account set by Netinstall |
 | SSH Password | *(blank)* | Leave blank if Netinstall leaves no password |
 | Max Parallel | `6` | Simultaneous provisioning sessions |
-| Config URL | `http://192.168.88.5:8000/…` | Full URL served by HFS |
+| Config URL | `http://192.168.88.5:80/…` | Full URL served by HFS |
 
 ### 2 – Scan for Routers
 
@@ -123,7 +123,7 @@ All activity is shown in the **Activity Log** panel at the bottom and saved to
 ## Provisioning Commands Sent
 
 ```routeros
-/tool fetch url="http://192.168.88.5:8000/mikrotik-provision/full-config.rsc" mode=http dst-path=full-config.rsc
+/tool fetch url="http://192.168.88.5:80/mikrotik-provision/full-config.rsc" mode=http dst-path=full-config.rsc
 /import file-name=full-config.rsc
 ```
 
@@ -151,7 +151,7 @@ All values can be adjusted at the top of `mikrotik_provisioner.py`.
 |---------|--------------------|
 | No routers discovered | Check that routers obtained DHCP IPs; verify SSH is enabled in the Netinstall minimal config |
 | `auth failed` in identity column | Wrong SSH username or password; routers may still have blank password – leave the Password field empty |
-| Fetch fails with timeout | HFS is not running or the URL is wrong; check `http://192.168.88.5:8000/` from a browser on the laptop |
+| Fetch fails with timeout | HFS is not running or the URL is wrong; check `http://192.168.88.5:80/` from a browser on the laptop |
 | Import succeeds but router is not configured | The `full-config.rsc` script may have syntax errors; test it manually on one router first |
 | GUI freezes | Should not happen – all network operations run in background threads; if it does, increase `SCAN_TIMEOUT` |
 
