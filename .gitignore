@@ -5,13 +5,18 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
-dist/
-build/
 
 # Runtime log
 mikrotik_provisioner.log
 
+# PyInstaller build output
+dist/
+build/
+*.spec
+
+# Generated icon (re-created by build.bat from logo.png)
+assets/logo.ico
+
 # IDE / editor
 .vscode/
 .idea/
-

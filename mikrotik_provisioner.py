@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QFont, QIcon
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1488,9 +1488,26 @@ class MainWindow(QMainWindow):
 #  Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resource_path(relative: str) -> str:
+    """
+    Return the absolute path to a bundled resource.
+    Works both during development (plain Python) and when frozen by PyInstaller
+    (where temporary files are extracted to sys._MEIPASS at runtime).
+    """
+    base = getattr(sys, "_MEIPASS",
+                   os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Set application icon (works in both dev and packaged EXE)
+    icon_path = _resource_path(os.path.join("assets", "logo.png"))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
