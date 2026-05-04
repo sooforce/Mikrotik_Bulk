@@ -24,6 +24,7 @@ import logging
 import ipaddress
 import datetime
 import time
+import struct
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -53,6 +54,13 @@ DEFAULT_SSH_USER    = "admin"
 DEFAULT_SSH_PASS    = ""
 DEFAULT_CONFIG_URL  = "http://192.168.88.5:80/mikrotik-provision/full-config.rsc"
 DEFAULT_CONCURRENCY = 6
+
+DEFAULT_DHCP_SERVER_IP  = "192.168.88.1"
+DEFAULT_DHCP_POOL_START = "192.168.88.100"
+DEFAULT_DHCP_POOL_END   = "192.168.88.200"
+DEFAULT_DHCP_SUBNET     = "255.255.255.0"
+DEFAULT_DHCP_GATEWAY    = "192.168.88.1"
+DEFAULT_DHCP_LEASE      = 3600          # seconds
 
 SSH_PORT           = 22
 SSH_TIMEOUT        = 10     # seconds – TCP connect + SSH handshake
@@ -533,6 +541,339 @@ class ProvisionWorker(QThread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  DHCP packet helpers  (RFC 2131)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DHCP_MAGIC_COOKIE = b'\x63\x82\x53\x63'
+
+
+def _parse_dhcp(data: bytes) -> dict:
+    """
+    Parse a raw DHCP/BOOTP packet.
+    Returns a dict with fixed-header fields, an 'options' sub-dict, and a
+    convenience 'msg_type' int.  Returns an empty dict on any parse failure.
+    """
+    if len(data) < 240:
+        return {}
+    if data[236:240] != DHCP_MAGIC_COOKIE:
+        return {}
+    pkt: dict = {}
+    pkt['op']     = data[0]
+    pkt['htype']  = data[1]
+    pkt['hlen']   = min(data[2], 16)   # guard against corrupt values
+    pkt['xid']    = data[4:8]
+    pkt['flags']  = struct.unpack('!H', data[10:12])[0]
+    pkt['ciaddr'] = data[12:16]
+    pkt['chaddr'] = data[28: 28 + pkt['hlen']]
+
+    # Parse TLV options (type–length–value)
+    options: dict = {}
+    i = 240
+    while i < len(data):
+        opt = data[i]
+        if opt == 255:           # END
+            break
+        if opt == 0:             # PAD
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            break
+        length = data[i + 1]
+        if i + 2 + length > len(data):
+            break
+        options[opt] = data[i + 2: i + 2 + length]
+        i += 2 + length
+
+    pkt['options']  = options
+    pkt['msg_type'] = options.get(53, b'\x00')[0]
+    return pkt
+
+
+def _build_dhcp_reply(pkt: dict, msg_type: int, server_ip: str,
+                      offered_ip: str, subnet: str, gateway: str,
+                      lease_time: int) -> bytes:
+    """Return a DHCP OFFER or ACK packet as raw bytes."""
+    hdr = bytearray(236)
+    hdr[0]           = 2                               # op = BOOTREPLY
+    hdr[1]           = pkt['htype']
+    hdr[2]           = pkt['hlen']
+    hdr[4:8]         = pkt['xid']
+    struct.pack_into('!H', hdr, 10, 0x8000)            # broadcast flag
+    hdr[12:16]       = pkt['ciaddr']                   # ciaddr (0 in DISCOVER)
+    hdr[16:20]       = socket.inet_aton(offered_ip)    # yiaddr
+    hdr[20:24]       = socket.inet_aton(server_ip)     # siaddr
+    hdr[28: 28 + pkt['hlen']] = pkt['chaddr']          # chaddr
+
+    opts = bytearray()
+
+    def _o(code: int, value: bytes):
+        opts.append(code)
+        opts.append(len(value))
+        opts.extend(value)
+
+    _o(53, bytes([msg_type]))                           # DHCP Message Type
+    _o(54, socket.inet_aton(server_ip))                 # Server Identifier
+    _o(51, struct.pack('!I', lease_time))               # IP Address Lease Time
+    _o(58, struct.pack('!I', lease_time // 2))          # Renewal Time (T1)
+    _o(59, struct.pack('!I', int(lease_time * 0.875)))  # Rebinding Time (T2)
+    _o(1,  socket.inet_aton(subnet))                    # Subnet Mask
+    _o(3,  socket.inet_aton(gateway))                   # Router (default gateway)
+    _o(6,  socket.inet_aton(gateway))                   # DNS (fallback to gateway)
+    opts.append(255)                                    # END
+
+    return bytes(hdr) + DHCP_MAGIC_COOKIE + bytes(opts)
+
+
+def _build_dhcp_nak(pkt: dict, server_ip: str) -> bytes:
+    """Return a DHCP NAK packet as raw bytes."""
+    hdr = bytearray(236)
+    hdr[0] = 2
+    hdr[1] = pkt['htype']
+    hdr[2] = pkt['hlen']
+    hdr[4:8] = pkt['xid']
+    struct.pack_into('!H', hdr, 10, 0x8000)
+    hdr[28: 28 + pkt['hlen']] = pkt['chaddr']
+
+    opts = bytearray()
+    opts += bytes([53, 1, 6])                           # DHCP NAK
+    opts += bytes([54, 4]) + socket.inet_aton(server_ip)
+    opts.append(255)                                    # END
+
+    return bytes(hdr) + DHCP_MAGIC_COOKIE + bytes(opts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DHCP Server Worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DhcpServerWorker(QThread):
+    """
+    Minimal RFC-2131 DHCP server.
+
+    Emits device_leased(ip, mac) the instant a DHCP ACK is sent so the GUI
+    can SSH-probe the device immediately — no polling or scanning required.
+
+    Requirements:
+      * The application must be run as Administrator (port 67 is privileged).
+      * Disable tftpd64's own DHCP server before starting this one.
+        tftpd64's TFTP server (port 69) can still run normally.
+    """
+
+    DISCOVER = 1
+    OFFER    = 2
+    REQUEST  = 3
+    ACK      = 5
+    NAK      = 6
+
+    device_leased  = pyqtSignal(str, str)  # (ip, mac_str)
+    log_message    = pyqtSignal(str)
+    server_stopped = pyqtSignal()
+
+    def __init__(self, server_ip: str, pool_start: str, pool_end: str,
+                 subnet: str, gateway: str, lease_seconds: int, parent=None):
+        super().__init__(parent)
+        self.server_ip     = server_ip
+        self.pool_start    = pool_start
+        self.pool_end      = pool_end
+        self.subnet        = subnet
+        self.gateway       = gateway
+        self.lease_seconds = lease_seconds
+        self._stop_event   = threading.Event()
+        self._leases:      Dict[str, tuple] = {}  # mac → (ip, expiry)
+        self._pool:        List[str]        = []
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _build_pool(self):
+        start = int(ipaddress.IPv4Address(self.pool_start))
+        end   = int(ipaddress.IPv4Address(self.pool_end))
+        self._pool = [str(ipaddress.IPv4Address(n))
+                      for n in range(start, end + 1)]
+
+    def _mac_str(self, chaddr: bytes, hlen: int) -> str:
+        return ':'.join(f'{b:02X}' for b in chaddr[:hlen])
+
+    def _assign_ip(self, mac: str) -> Optional[str]:
+        """Return the current or a new IP for *mac*, or None if pool is full."""
+        now = time.time()
+        # Honour an existing unexpired lease (also renews it)
+        if mac in self._leases:
+            ip, expiry = self._leases[mac]
+            if expiry > now:
+                self._leases[mac] = (ip, now + self.lease_seconds)
+                return ip
+        # Reclaim any expired leases
+        for m in [m for m, (_, exp) in list(self._leases.items())
+                  if exp <= now]:
+            del self._leases[m]
+        # Allocate first free IP
+        used = {ip for ip, _ in self._leases.values()}
+        for ip in self._pool:
+            if ip not in used:
+                self._leases[mac] = (ip, now + self.lease_seconds)
+                return ip
+        return None   # pool exhausted
+
+    def run(self):
+        self._build_pool()
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            srv.bind(('', 67))
+            srv.settimeout(1.0)
+        except PermissionError:
+            self.log_message.emit(
+                "DHCP ERROR: Cannot bind to port 67 — "
+                "restart the application as Administrator.")
+            self.server_stopped.emit()
+            return
+        except Exception as exc:
+            self.log_message.emit(f"DHCP ERROR: Failed to start server: {exc}")
+            self.server_stopped.emit()
+            return
+
+        self.log_message.emit(
+            f"DHCP server listening | server {self.server_ip} | "
+            f"pool {self.pool_start}–{self.pool_end} | "
+            f"mask {self.subnet} | gw {self.gateway}"
+        )
+
+        while not self._stop_event.is_set():
+            try:
+                data, _ = srv.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    self.log_message.emit(f"DHCP recv error: {exc}")
+                break
+            try:
+                self._handle(srv, data)
+            except Exception as exc:
+                self.log_message.emit(f"DHCP packet handling error: {exc}")
+
+        try:
+            srv.close()
+        except Exception:
+            pass
+        self.log_message.emit("DHCP server stopped.")
+        self.server_stopped.emit()
+
+    def _handle(self, srv: socket.socket, data: bytes):
+        pkt = _parse_dhcp(data)
+        if not pkt or pkt.get('op') != 1:   # only BOOTREQUEST packets
+            return
+
+        mac = self._mac_str(pkt['chaddr'], pkt['hlen'])
+        mt  = pkt['msg_type']
+
+        # Option 54 = Server Identifier — ignore requests aimed at another server
+        sid_opt = pkt['options'].get(54)
+        if sid_opt and len(sid_opt) == 4:
+            if socket.inet_ntoa(sid_opt) != self.server_ip:
+                return
+
+        if mt == self.DISCOVER:
+            ip = self._assign_ip(mac)
+            if ip is None:
+                self.log_message.emit(
+                    f"DHCP DISCOVER from {mac} — pool exhausted, ignoring.")
+                return
+            self.log_message.emit(f"DHCP DISCOVER from {mac} → OFFER {ip}")
+            reply = _build_dhcp_reply(
+                pkt, self.OFFER, self.server_ip, ip,
+                self.subnet, self.gateway, self.lease_seconds,
+            )
+            srv.sendto(reply, ('255.255.255.255', 68))
+
+        elif mt == self.REQUEST:
+            # Option 50 = Requested IP Address (present in SELECTING state)
+            req_opt = pkt['options'].get(50)
+            requested = socket.inet_ntoa(req_opt) if (
+                req_opt and len(req_opt) == 4) else None
+
+            assigned = self._assign_ip(mac)
+            if assigned and (requested is None or requested == assigned):
+                self.log_message.emit(
+                    f"DHCP REQUEST from {mac} → ACK {assigned}")
+                reply = _build_dhcp_reply(
+                    pkt, self.ACK, self.server_ip, assigned,
+                    self.subnet, self.gateway, self.lease_seconds,
+                )
+                srv.sendto(reply, ('255.255.255.255', 68))
+                # Key: signal the GUI immediately so SSH probe starts at once
+                self.device_leased.emit(assigned, mac)
+            else:
+                self.log_message.emit(
+                    f"DHCP REQUEST from {mac} → NAK "
+                    f"(requested={requested}, assigned={assigned})")
+                nak = _build_dhcp_nak(pkt, self.server_ip)
+                srv.sendto(nak, ('255.255.255.255', 68))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Single-IP Probe Worker  (triggered by a DHCP lease event)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SingleProbeWorker(QThread):
+    """
+    Waits for SSH to become available on *ip* (the router may still be
+    finishing its boot), then gathers identity / version / MAC and reports
+    the result via router_found so the GUI can add a table row immediately.
+    """
+
+    router_found = pyqtSignal(object)  # RouterInfo instance
+    log_message  = pyqtSignal(str)
+
+    _WAIT_INTERVAL = 3    # seconds between TCP-22 retries while booting
+    _WAIT_MAX      = 180  # seconds before giving up
+
+    def __init__(self, ip: str, mac: str,
+                 ssh_user: str, ssh_pass: str, parent=None):
+        super().__init__(parent)
+        self.ip       = ip
+        self.mac      = mac
+        self.ssh_user = ssh_user
+        self.ssh_pass = ssh_pass
+
+    def run(self):
+        ip = self.ip
+        self.log_message.emit(
+            f"[DHCP→SSH] {ip} ({self.mac}) — waiting for SSH port…")
+
+        deadline = time.monotonic() + self._WAIT_MAX
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((ip, SSH_PORT), timeout=2):
+                    break
+            except OSError:
+                time.sleep(self._WAIT_INTERVAL)
+        else:
+            self.log_message.emit(
+                f"[DHCP→SSH] {ip} — SSH did not open within "
+                f"{self._WAIT_MAX}s; giving up.")
+            return
+
+        router = RouterInfo(ip=ip, mac=self.mac)
+        try:
+            details = _gather_router_info(ip, self.ssh_user, self.ssh_pass)
+            router.identity = details["identity"]
+            router.version  = details["version"]
+            if details["mac"] != "—":
+                router.mac = details["mac"]
+        except Exception as exc:
+            log.warning("[%s] Post-DHCP SSH probe failed: %s", ip, exc)
+            router.identity = "(auth failed?)"
+
+        self.log_message.emit(
+            f"[DHCP→SSH] {ip} online — "
+            f"identity={router.identity}  version={router.version}")
+        self.router_found.emit(router)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main Window
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -549,6 +890,8 @@ class MainWindow(QMainWindow):
         self._provision_semaphore: Optional[threading.Semaphore] = None
         self._active_provisions:   int                         = 0
         self._url_check_worker:    Optional[UrlCheckWorker]    = None
+        self._dhcp_worker:         Optional[DhcpServerWorker]   = None
+        self._probe_workers:       List[SingleProbeWorker]      = []
 
         self._build_ui()
         self._connect_signals()
@@ -614,6 +957,63 @@ class MainWindow(QMainWindow):
             "Verify that the config file URL is reachable from this laptop")
         url_lay.addWidget(self.le_config_url)
         url_lay.addWidget(self.btn_test_url)
+
+        # ── Built-in DHCP Server ─────────────────────────────────────────────
+        dhcp_grp = QGroupBox(
+            "Built-in DHCP Server  "
+            "(disable tftpd64 DHCP when using this · requires Administrator)"
+        )
+        dhcp_outer = QVBoxLayout(dhcp_grp)
+        dhcp_row1  = QHBoxLayout()
+        dhcp_row2  = QHBoxLayout()
+
+        self.le_dhcp_server_ip  = QLineEdit(DEFAULT_DHCP_SERVER_IP)
+        self.le_dhcp_server_ip.setFixedWidth(115)
+        self.le_dhcp_pool_start = QLineEdit(DEFAULT_DHCP_POOL_START)
+        self.le_dhcp_pool_start.setFixedWidth(115)
+        self.le_dhcp_pool_end   = QLineEdit(DEFAULT_DHCP_POOL_END)
+        self.le_dhcp_pool_end.setFixedWidth(115)
+        self.le_dhcp_subnet  = QLineEdit(DEFAULT_DHCP_SUBNET)
+        self.le_dhcp_subnet.setFixedWidth(115)
+        self.le_dhcp_gateway = QLineEdit(DEFAULT_DHCP_GATEWAY)
+        self.le_dhcp_gateway.setFixedWidth(115)
+        self.sb_dhcp_lease   = QSpinBox()
+        self.sb_dhcp_lease.setRange(60, 86400)
+        self.sb_dhcp_lease.setValue(DEFAULT_DHCP_LEASE)
+        self.sb_dhcp_lease.setFixedWidth(75)
+
+        self.btn_start_dhcp  = QPushButton("Start DHCP Server")
+        self.btn_start_dhcp.setMinimumHeight(28)
+        self.btn_stop_dhcp   = QPushButton("Stop DHCP Server")
+        self.btn_stop_dhcp.setMinimumHeight(28)
+        self.btn_stop_dhcp.setEnabled(False)
+        self.lbl_dhcp_status = QLabel("Stopped")
+
+        dhcp_row1.addWidget(QLabel("Server IP:"))
+        dhcp_row1.addWidget(self.le_dhcp_server_ip)
+        dhcp_row1.addWidget(QLabel("  Pool:"))
+        dhcp_row1.addWidget(self.le_dhcp_pool_start)
+        dhcp_row1.addWidget(QLabel("to"))
+        dhcp_row1.addWidget(self.le_dhcp_pool_end)
+        dhcp_row1.addStretch()
+
+        dhcp_row2.addWidget(QLabel("Subnet Mask:"))
+        dhcp_row2.addWidget(self.le_dhcp_subnet)
+        dhcp_row2.addWidget(QLabel("  Gateway:"))
+        dhcp_row2.addWidget(self.le_dhcp_gateway)
+        dhcp_row2.addWidget(QLabel("  Lease:"))
+        dhcp_row2.addWidget(self.sb_dhcp_lease)
+        dhcp_row2.addWidget(QLabel("s"))
+        dhcp_row2.addSpacing(10)
+        dhcp_row2.addWidget(self.btn_start_dhcp)
+        dhcp_row2.addWidget(self.btn_stop_dhcp)
+        dhcp_row2.addSpacing(10)
+        dhcp_row2.addWidget(QLabel("Status:"))
+        dhcp_row2.addWidget(self.lbl_dhcp_status)
+        dhcp_row2.addStretch()
+
+        dhcp_outer.addLayout(dhcp_row1)
+        dhcp_outer.addLayout(dhcp_row2)
 
         # ── Scan control bar ─────────────────────────────────────────────────
         scan_bar = QHBoxLayout()
@@ -695,6 +1095,7 @@ class MainWindow(QMainWindow):
         # ── Assemble root ────────────────────────────────────────────────────
         root.addLayout(settings_row)
         root.addWidget(url_grp)
+        root.addWidget(dhcp_grp)
         root.addWidget(splitter)
 
     # ── Signal connections ───────────────────────────────────────────────────
@@ -707,6 +1108,8 @@ class MainWindow(QMainWindow):
         self.btn_deselect_all.clicked.connect(self._deselect_all)
         self.btn_provision.clicked.connect(self._start_provisioning)
         self.btn_test_url.clicked.connect(self._test_hfs_url)
+        self.btn_start_dhcp.clicked.connect(self._start_dhcp_server)
+        self.btn_stop_dhcp.clicked.connect(self._stop_dhcp_server)
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -890,6 +1293,89 @@ class MainWindow(QMainWindow):
         # Enrich any missing MACs from the Windows ARP cache
         self._refresh_macs_from_arp()
 
+    # ── Built-in DHCP Server ─────────────────────────────────────────────────
+
+    def _start_dhcp_server(self):
+        server_ip  = self.le_dhcp_server_ip.text().strip()
+        pool_start = self.le_dhcp_pool_start.text().strip()
+        pool_end   = self.le_dhcp_pool_end.text().strip()
+        subnet     = self.le_dhcp_subnet.text().strip()
+        gateway    = self.le_dhcp_gateway.text().strip()
+        lease      = self.sb_dhcp_lease.value()
+
+        for label, addr in (
+            ("Server IP",   server_ip),
+            ("Pool start",  pool_start),
+            ("Pool end",    pool_end),
+            ("Subnet mask", subnet),
+            ("Gateway",     gateway),
+        ):
+            try:
+                ipaddress.IPv4Address(addr)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid Address",
+                    f"'{addr}' is not a valid IPv4 address ({label}).")
+                return
+
+        if int(ipaddress.IPv4Address(pool_start)) > int(
+                ipaddress.IPv4Address(pool_end)):
+            QMessageBox.warning(self, "Invalid Pool",
+                                "Pool start address must be ≤ pool end address.")
+            return
+
+        self.btn_start_dhcp.setEnabled(False)
+        self.btn_stop_dhcp.setEnabled(True)
+        self.lbl_dhcp_status.setText("Starting…")
+        self._log(
+            f"Starting DHCP server: {server_ip}  "
+            f"pool {pool_start}–{pool_end}  mask {subnet}  gw {gateway}"
+        )
+
+        self._dhcp_worker = DhcpServerWorker(
+            server_ip, pool_start, pool_end, subnet, gateway, lease)
+        self._dhcp_worker.device_leased.connect(self._on_device_leased)
+        self._dhcp_worker.log_message.connect(self._log)
+        self._dhcp_worker.server_stopped.connect(self._on_dhcp_stopped)
+        self._dhcp_worker.start()
+        self.lbl_dhcp_status.setText("Running")
+
+    def _stop_dhcp_server(self):
+        if self._dhcp_worker and self._dhcp_worker.isRunning():
+            self._dhcp_worker.stop()
+        self.btn_stop_dhcp.setEnabled(False)
+        self.lbl_dhcp_status.setText("Stopping…")
+
+    def _on_dhcp_stopped(self):
+        self.btn_start_dhcp.setEnabled(True)
+        self.btn_stop_dhcp.setEnabled(False)
+        self.lbl_dhcp_status.setText("Stopped")
+
+    def _on_device_leased(self, ip: str, mac: str):
+        """
+        Called immediately when a DHCP ACK is sent to a device.
+        Starts a SingleProbeWorker that waits for SSH and then populates
+        the table row — no manual scan needed.
+        """
+        self._log(f"[DHCP] Lease issued: {ip}  MAC={mac} — probing SSH…")
+        if ip in self._routers:
+            # Already known from a previous scan; skip duplicate probe.
+            self._log(f"[DHCP] {ip} already in table — skipping re-probe.")
+            return
+        ssh_user = self.le_ssh_user.text().strip()
+        ssh_pass = self.le_ssh_pass.text()
+        worker = SingleProbeWorker(ip, mac, ssh_user, ssh_pass)
+        worker.router_found.connect(self._on_router_found)
+        worker.log_message.connect(self._log)
+        worker.finished.connect(self._cleanup_probe_workers)
+        self._probe_workers.append(worker)
+        worker.start()
+
+    def _cleanup_probe_workers(self):
+        """Remove finished SingleProbeWorker instances from the tracking list."""
+        self._probe_workers = [
+            w for w in self._probe_workers if w.isRunning()]
+
     def _clear_table(self):
         if self._scan_worker and self._scan_worker.isRunning():
             QMessageBox.information(self, "Scan Running",
@@ -986,6 +1472,12 @@ class MainWindow(QMainWindow):
         if self._scan_worker and self._scan_worker.isRunning():
             self._scan_worker.stop()
             self._scan_worker.wait(3000)
+        if self._dhcp_worker and self._dhcp_worker.isRunning():
+            self._dhcp_worker.stop()
+            self._dhcp_worker.wait(3000)
+        for w in self._probe_workers:
+            if w.isRunning():
+                w.wait(3000)
         for w in self._provision_workers:
             if w.isRunning():
                 w.wait(3000)
