@@ -33,12 +33,7 @@ echo.
 set ICON_ARG=
 if exist "assets\logo.png" (
     echo  Converting assets\logo.png to assets\logo.ico ...
-    python -c ^
-        "from PIL import Image; ^
-         img = Image.open('assets/logo.png').convert('RGBA'); ^
-         img.save('assets/logo.ico', format='ICO', ^
-                  sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)]); ^
-         print('  Icon saved: assets/logo.ico')"
+    python make_icon.py
     if exist "assets\logo.ico" (
         set ICON_ARG=--icon=assets\logo.ico
     )
